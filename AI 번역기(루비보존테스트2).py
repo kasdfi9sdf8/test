@@ -5240,54 +5240,74 @@ def process_ncx(ncx_bytes, updated_metadata, nav_translations, model, api_call_d
 
         items_translated_count = 0
         logging.info("NCX 내비게이션 항목 번역 시작...")
+
+        # --- 1단계: 모든 navLabel 수집 및 사전 번역 적용 ---
+        nav_label_nodes = []  # (text_tag, original_nav_text) 쌍
+        api_needed_texts = []  # API 번역이 필요한 고유 원문 목록 (순서 유지)
+        api_needed_set = set()
+
         for navLabel in tree.findall('.//ncx:navMap//ncx:navLabel', NS):
             text_tag = navLabel.find('ncx:text', NS)
             if text_tag is not None and text_tag.text:
                 original_nav_text = text_tag.text.strip()
-                if not original_nav_text: continue
-
+                if not original_nav_text:
+                    continue
                 translated_text_dict = nav_translations.get(original_nav_text)
-                translated_text_final = None
-                translation_source = None
-
                 if translated_text_dict and translated_text_dict != original_nav_text:
-                    translated_text_final = translated_text_dict
-                    translation_source = 'Dictionary'
-                elif not translated_text_dict:
-                    current_time = time.time()
-                    time_since_last_call = current_time - last_api_call_time_ref[0]
-                    if time_since_last_call < api_call_delay:
-                        sleep_time = api_call_delay - time_since_last_call
-                        time.sleep(sleep_time)
-
+                    # 사전에서 즉시 번역
                     try:
-                        nav_translation_prompt = "Translate the following Japanese navigation menu item text to Korean. Output only the Korean translation, without any explanations or quotation marks: '{text}'"
-                        prompt = nav_translation_prompt.format(text=original_nav_text)
-                        response = model.generate_content(prompt)
-                        last_api_call_time_ref[0] = time.time()
-                        translated_text_api_raw = response.text.strip()
-                        translated_text_api = translated_text_api_raw.strip('"\'')
-
-                        if translated_text_api and translated_text_api != original_nav_text:
-                            translated_text_final = translated_text_api
-                            translation_source = 'API'
-                        else:
-                            logging.warning(f"API translation failed or no change (NCX Nav: '{original_nav_text}'). Raw result: '{translated_text_api_raw}'")
-
-                    except InvalidArgument as iae:
-                         last_api_call_time_ref[0] = time.time()
-                         logging.error(f"NCX Nav 항목 '{original_nav_text}' API 호출 중 InvalidArgument 오류: {iae}")
-                    except Exception as api_err:
-                        last_api_call_time_ref[0] = time.time()
-                        logging.error(f"NCX 내비게이션 항목 '{original_nav_text}' API 번역 중 오류: {api_err}")
-
-                if translated_text_final:
-                    try:
-                        text_tag.text = translated_text_final
+                        text_tag.text = translated_text_dict
                         ncx_modified = True
                         items_translated_count += 1
                     except Exception as replace_err:
                         logging.error(f"NCX navLabel 텍스트 교체 중 오류 ('{original_nav_text}'): {replace_err}")
+                elif not translated_text_dict:
+                    # API 번역이 필요한 항목 수집
+                    nav_label_nodes.append((text_tag, original_nav_text))
+                    if original_nav_text not in api_needed_set:
+                        api_needed_texts.append(original_nav_text)
+                        api_needed_set.add(original_nav_text)
+
+        # --- 2단계: API 번역이 필요한 항목을 단일 배치 호출로 번역 ---
+        api_translation_map = {}
+        if api_needed_texts:
+            current_time = time.time()
+            time_since_last_call = current_time - last_api_call_time_ref[0]
+            if time_since_last_call < api_call_delay:
+                time.sleep(api_call_delay - time_since_last_call)
+
+            batch_prompt = (
+                "Translate each of the following Japanese navigation menu items to Korean. "
+                "Output exactly one Korean translation per line, in the same order, "
+                "without line numbers, explanations, or quotation marks:\n"
+                + "\n".join(api_needed_texts)
+            )
+            try:
+                response = model.generate_content(batch_prompt)
+                last_api_call_time_ref[0] = time.time()
+                result_lines = [l.strip().strip('"\'') for l in response.text.splitlines() if l.strip()]
+                for i, orig in enumerate(api_needed_texts):
+                    if i < len(result_lines) and result_lines[i] and result_lines[i] != orig:
+                        api_translation_map[orig] = result_lines[i]
+                    else:
+                        logging.warning(f"NCX 배치 번역: 항목 '{orig}'에 대한 결과 없음 또는 변경 없음.")
+            except InvalidArgument as iae:
+                last_api_call_time_ref[0] = time.time()
+                logging.error(f"NCX 배치 API 호출 중 InvalidArgument 오류: {iae}")
+            except Exception as api_err:
+                last_api_call_time_ref[0] = time.time()
+                logging.error(f"NCX 배치 API 번역 중 오류: {api_err}")
+
+        # --- 3단계: 배치 번역 결과 적용 ---
+        for text_tag, original_nav_text in nav_label_nodes:
+            translated_text_final = api_translation_map.get(original_nav_text)
+            if translated_text_final:
+                try:
+                    text_tag.text = translated_text_final
+                    ncx_modified = True
+                    items_translated_count += 1
+                except Exception as replace_err:
+                    logging.error(f"NCX navLabel 텍스트 교체 중 오류 ('{original_nav_text}'): {replace_err}")
 
         if ncx_modified:
             logging.info(f"NCX 파일 수정 완료 ({items_translated_count}개 항목 번역됨). 직렬화 중...")
@@ -5383,7 +5403,11 @@ def process_nav_doc(nav_doc_bytes, updated_metadata, model, api_call_delay, last
         if nav_items:
              logging.info("Nav Doc 내비게이션 항목 번역 시작...")
              global NAV_TRANSLATIONS
-             nav_translation_prompt = "Translate the following Japanese navigation menu item text to Korean. Output only the Korean translation, without any explanations or quotation marks: '{text}'"
+
+             # --- 1단계: target_node 추출 및 사전 번역 적용 ---
+             item_node_pairs = []  # (target_node, original_text) - API 번역 필요 항목
+             api_needed_texts_nav = []  # API 번역이 필요한 고유 원문 (순서 유지)
+             api_needed_set_nav = set()
 
              for item_tag in nav_items:
                  target_node = None
@@ -5400,43 +5424,55 @@ def process_nav_doc(nav_doc_bytes, updated_metadata, model, api_call_delay, last
                  original_text = str(target_node).strip()
                  if not original_text: continue
 
-                 translated_text_final = None
-                 translation_source = None
-
                  translated_text_dict = NAV_TRANSLATIONS.get(original_text)
                  if translated_text_dict is not None and translated_text_dict != original_text:
-                     translated_text_final = translated_text_dict
-                     translation_source = 'Dictionary'
-
-                 is_api_condition_met = translated_text_dict is None
-
-                 if is_api_condition_met:
-                     current_time = time.time()
-                     time_since_last_call = current_time - last_api_call_time_ref[0]
-                     if time_since_last_call < api_call_delay:
-                         sleep_time = api_call_delay - time_since_last_call
-                         time.sleep(sleep_time)
-
+                     # 사전에서 즉시 번역
                      try:
-                         prompt = nav_translation_prompt.format(text=original_text)
-                         response = model.generate_content(prompt)
-                         last_api_call_time_ref[0] = time.time()
-                         translated_text_api_raw = response.text
-                         translated_text_api = translated_text_api_raw.strip().strip('"\'')
+                         target_node.replace_with(NavigableString(translated_text_dict))
+                         content_modified_by_soup = True
+                         items_translated_count += 1
+                     except Exception as replace_err:
+                         logging.error(f"Nav Doc 텍스트 교체 중 오류 ('{original_text}' -> '{translated_text_dict}'): {replace_err}")
+                 elif translated_text_dict is None:
+                     # API 번역이 필요한 항목 수집
+                     item_node_pairs.append((target_node, original_text))
+                     if original_text not in api_needed_set_nav:
+                         api_needed_texts_nav.append(original_text)
+                         api_needed_set_nav.add(original_text)
 
-                         if translated_text_api and translated_text_api != original_text:
-                             translated_text_final = translated_text_api
-                             translation_source = 'API'
+             # --- 2단계: API 번역이 필요한 항목을 단일 배치 호출로 번역 ---
+             api_translation_map_nav = {}
+             if api_needed_texts_nav:
+                 current_time = time.time()
+                 time_since_last_call = current_time - last_api_call_time_ref[0]
+                 if time_since_last_call < api_call_delay:
+                     time.sleep(api_call_delay - time_since_last_call)
+
+                 batch_prompt = (
+                     "Translate each of the following Japanese navigation menu items to Korean. "
+                     "Output exactly one Korean translation per line, in the same order, "
+                     "without line numbers, explanations, or quotation marks:\n"
+                     + "\n".join(api_needed_texts_nav)
+                 )
+                 try:
+                     response = model.generate_content(batch_prompt)
+                     last_api_call_time_ref[0] = time.time()
+                     result_lines = [l.strip().strip('"\'') for l in response.text.splitlines() if l.strip()]
+                     for i, orig in enumerate(api_needed_texts_nav):
+                         if i < len(result_lines) and result_lines[i] and result_lines[i] != orig:
+                             api_translation_map_nav[orig] = result_lines[i]
                          else:
-                             logging.warning(f"API translation failed or no change (Nav Doc: '{original_text}'). Raw result: '{translated_text_api_raw}'")
+                             logging.warning(f"Nav Doc 배치 번역: 항목 '{orig}'에 대한 결과 없음 또는 변경 없음.")
+                 except InvalidArgument as iae:
+                     last_api_call_time_ref[0] = time.time()
+                     logging.error(f"Nav Doc 배치 API 호출 중 InvalidArgument 오류: {iae}")
+                 except Exception as api_err:
+                     last_api_call_time_ref[0] = time.time()
+                     logging.error(f"Nav Doc 배치 API 번역 중 오류: {api_err}")
 
-                     except InvalidArgument as iae:
-                          last_api_call_time_ref[0] = time.time()
-                          logging.error(f"Nav Doc 항목 '{original_text}' API 호출 중 InvalidArgument 오류: {iae}")
-                     except Exception as api_err:
-                         last_api_call_time_ref[0] = time.time()
-                         logging.error(f"Nav Doc 항목 '{original_text}' API 번역 중 오류: {api_err}")
-
+             # --- 3단계: 배치 번역 결과 적용 ---
+             for target_node, original_text in item_node_pairs:
+                 translated_text_final = api_translation_map_nav.get(original_text)
                  if translated_text_final:
                      try:
                          target_node.replace_with(NavigableString(translated_text_final))
