@@ -792,6 +792,12 @@ def detect_japanese_or_chinese(text):
 
 # --- 2. EPUB 파일 처리 (저수준) ---
 
+def clean_text_from_tags(html_content):
+    """HTML 태그를 제거하고 순수 텍스트를 반환합니다."""
+    text = re.sub(r'<[^>]+>', '', html_content)
+    return text
+
+
 def find_opf_file(epub_file):
     for item in epub_file.infolist():
         if item.filename.endswith(".opf"):
@@ -1839,6 +1845,41 @@ def preprocess_repeated_japanese_chars(text: str) -> str:
     
 # --- 일본어 반복 문자 전처리 관련 코드 끝 ---
 
+
+def restore_indentation_from_origin(translated_text, origin_filepath):
+    """원본 파일의 들여쓰기(　, U+3000)를 번역문에 복원합니다.
+
+    원본의 각 비공백 줄과 번역문의 각 비공백 줄을 순서대로 대응시켜,
+    원본 줄이 전각 공백(　)으로 시작하면 해당 전각 공백을 번역 줄 앞에 붙입니다.
+    """
+    if not os.path.exists(origin_filepath):
+        return translated_text
+    try:
+        with open(origin_filepath, 'r', encoding='utf-8') as f:
+            origin_text = f.read()
+    except Exception:
+        return translated_text
+
+    origin_non_empty = [l for l in origin_text.splitlines() if l.strip()]
+    trans_lines = translated_text.splitlines()
+    trans_non_empty_indices = [i for i, l in enumerate(trans_lines) if l.strip()]
+
+    for j, idx in enumerate(trans_non_empty_indices):
+        if j < len(origin_non_empty):
+            origin_line = origin_non_empty[j]
+            # 선행 전각 공백(　) 수집
+            leading = ''
+            for ch in origin_line:
+                if ch == '\u3000':
+                    leading += ch
+                else:
+                    break
+            if leading and not trans_lines[idx].startswith('\u3000'):
+                trans_lines[idx] = leading + trans_lines[idx]
+
+    return '\n'.join(trans_lines)
+
+
 # 기존 `translate_single_block` 함수 시작 (이 부분부터 기존 함수 내용으로 대체)
 def translate_single_block(item, model, base_prompt_instructions, base_prompt_text, additional_instructions, glossary_content, character_dictionary, block_pbar, retry_count=3, retry_delay=10, api_call_delay=0.6):
     import copy
@@ -1945,6 +1986,9 @@ def translate_single_block(item, model, base_prompt_instructions, base_prompt_te
     processed_text = ""
     if status == 'success' and stream_successful:
         processed_text = apply_regex_transformations(full_translated_text_from_stream)
+        # 원본 파일의 선행 들여쓰기(　) 복원
+        origin_filepath = filepath.replace(".txt", ".origin.txt")
+        processed_text = restore_indentation_from_origin(processed_text, origin_filepath)
     elif status == 'needs_line_translation':
         processed_text = original_text
         final_output_chars = len(processed_text)
@@ -2131,6 +2175,16 @@ def translate_single_line_item(item, index, model, prompt_details, line_pbar, ap
                     logging.warning(f"Result empty postprocess line {index} (attempt {attempt+1}).")
                     if attempt < retry_attempts - 1: time.sleep(5)
                     continue
+
+                # 원본 줄의 선행 들여쓰기(　) 복원
+                orig_leading = ''
+                for ch in current_text:
+                    if ch == '\u3000':
+                        orig_leading += ch
+                    else:
+                        break
+                if orig_leading and not text_to_write.startswith('\u3000'):
+                    text_to_write = orig_leading + text_to_write
 
                 output_chars = len(text_to_write)
                 status = 'success'
@@ -2951,6 +3005,8 @@ def retranslate_single_block_streaming_parallel(file_info, model, translation_da
             # 스트림 성공 시 후처리 및 결과 저장
             if stream_successful_this_retry:
                 processed_text_attempt = apply_regex_transformations(current_full_translated_text)
+                # 원본 파일의 선행 들여쓰기(　) 복원
+                processed_text_attempt = restore_indentation_from_origin(processed_text_attempt, original_filepath)
                 logging.info(f"Parallel Retranslated (streamed) text for {os.path.basename(filepath)}:\n{processed_text_attempt[:100]}...")
 
                 # 파일에 쓰기 (재번역 결과)
@@ -5018,8 +5074,9 @@ def reconstruct_translated_xhtml(xhtml_base_name, json_data, output_dir, mode=No
             elif block_type.startswith("text_block"):
                 processed_lines = []
                 for line in content_part.splitlines():
-                    stripped_line = line.strip()
-                    if stripped_line:
+                    # ASCII 공백만 제거하여 전각 공백(　)을 보존
+                    stripped_line = line.strip(' \t\r\n')
+                    if stripped_line and stripped_line.strip():
                         # 줄이 HTML 태그(예: <ruby>)로 시작하는지 확인
                         is_html_like = re.match(r'^\s*<.+>', stripped_line, re.DOTALL)
                         
