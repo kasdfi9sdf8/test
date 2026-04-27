@@ -823,6 +823,13 @@ def detect_japanese_or_chinese(text):
 
 # --- 2. EPUB 파일 처리 (저수준) ---
 
+def clean_text_from_tags(html_content):
+    """HTML 태그를 제거하고 순수 텍스트 내용만 반환합니다."""
+    if not html_content:
+        return ""
+    return re.sub(r'<[^>]+>', '', html_content)
+
+
 def find_opf_file(epub_file):
     for item in epub_file.infolist():
         if item.filename.endswith(".opf"):
@@ -1116,9 +1123,22 @@ def add_text_block(xhtml_json_list, text_block_content, text_block_counter,
              save_txt_file(final_text_content, origin_filename)
              # shutil.copy2(text_block_filename, origin_filename) # 정제된 파일 복사
 
+        # 원본 HTML 구조 저장: 재구성 시 원본 태그(클래스 등) 복원에 사용
+        struct_filename = os.path.join(output_dir, f"text_block_{text_block_counter}.struct.txt")
+        if not os.path.exists(struct_filename):
+            struct_html_lines = [
+                line for line in text_block_content.splitlines()
+                if clean_text_from_tags(line).strip()
+            ]
+            if struct_html_lines:
+                save_txt_file("\n".join(struct_html_lines), struct_filename)
+            else:
+                struct_filename = None
+        
         xhtml_json_list.append({
             "type": "text_block",
-            "content": text_block_filename
+            "content": text_block_filename,
+            "struct": struct_filename
         })
         logging.debug(f"Added text block: {text_block_filename}")
         return xhtml_json_list, text_block_counter + 1
@@ -5051,20 +5071,61 @@ def reconstruct_translated_xhtml(xhtml_base_name, json_data, output_dir, mode=No
             
             # --- START: 여기가 수정된 핵심 로직입니다. ---
             elif block_type.startswith("text_block"):
+                # 원본 HTML 구조 파일 로드 (원본 태그/클래스 복원에 사용)
+                struct_filepath = block.get("struct")
+                struct_html_lines = []
+                if struct_filepath:
+                    if not os.path.isabs(struct_filepath):
+                        struct_filepath = os.path.join(output_dir, struct_filepath)
+                    if os.path.exists(struct_filepath):
+                        try:
+                            with open(struct_filepath, 'r', encoding='utf-8') as sf:
+                                struct_html_lines = sf.read().splitlines()
+                        except Exception as struct_err:
+                            logging.warning(f"구조 파일 읽기 실패 ({struct_filepath}): {struct_err}")
+
                 processed_lines = []
-                for line in content_part.splitlines():
-                    stripped_line = line.strip()
-                    if stripped_line:
-                        # 줄이 HTML 태그(예: <ruby>)로 시작하는지 확인
-                        is_html_like = re.match(r'^\s*<.+>', stripped_line, re.DOTALL)
-                        
-                        if is_html_like:
-                            # 이미 태그가 있으면 그대로 추가
-                            processed_lines.append(stripped_line) 
+                translated_lines = [l for l in content_part.splitlines() if l.strip()]
+
+                if struct_html_lines:
+                    # 원본 HTML 구조(태그, 클래스 등)를 유지하면서 번역된 텍스트로 교체
+                    for i, trans_line in enumerate(translated_lines):
+                        if i < len(struct_html_lines):
+                            struct_line = struct_html_lines[i]
+                            # 최외곽 태그 추출: <tag attrs>...</tag>
+                            tag_wrap = re.match(
+                                r'^(\s*<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>)(.*?)(<\/\2\s*>)\s*$',
+                                struct_line, re.DOTALL
+                            )
+                            if tag_wrap:
+                                open_tag = tag_wrap.group(1)
+                                close_tag = tag_wrap.group(4)
+                                processed_lines.append(f'{open_tag}{trans_line}{close_tag}')
+                            elif re.match(r'^\s*<.+>', struct_line, re.DOTALL):
+                                # 닫힘 태그 없는 자기닫힘 등 특수 구조 → 원본 유지
+                                processed_lines.append(struct_line)
+                            else:
+                                processed_lines.append(f'<p class="korean_style">{trans_line}</p>')
                         else:
-                            # 순수 텍스트 줄에만 <p> 태그 추가
-                            processed_lines.append(f'<p class="korean_style">{stripped_line}</p>')
-                
+                            # 구조 파일보다 번역 줄이 많은 경우 기본 태그로 래핑
+                            processed_lines.append(f'<p class="korean_style">{trans_line}</p>')
+                else:
+                    # 구조 파일 없는 경우: 원본 들여쓰기와 빈 줄을 보존
+                    for line in content_part.splitlines():
+                        stripped_line = line.strip()
+                        if stripped_line:
+                            # 줄이 HTML 태그(예: <ruby>)로 시작하는지 확인
+                            is_html_like = re.match(r'^\s*<.+>', line, re.DOTALL)
+                            if is_html_like:
+                                # 이미 태그가 있으면 원본 들여쓰기 유지
+                                processed_lines.append(line)
+                            else:
+                                # 순수 텍스트 줄에만 <p> 태그 추가
+                                processed_lines.append(f'<p class="korean_style">{stripped_line}</p>')
+                        else:
+                            # 빈 줄(간격)도 보존
+                            processed_lines.append(line)
+
                 body_parts.append("\n".join(processed_lines))
             # --- END: 수정된 핵심 로직 끝 ---
             
@@ -5080,26 +5141,48 @@ def reconstruct_translated_xhtml(xhtml_base_name, json_data, output_dir, mode=No
         logging.debug(f"XHTML '{xhtml_base_name}' 내용 재구성 완료.")
 
         try:
-            soup = BeautifulSoup(reconstructed_xhtml, 'html.parser')
-            html_tag = soup.find('html')
-            if html_tag:
-                if html_tag.get('lang') != 'ko':
-                    html_tag['lang'] = 'ko'
-                    logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 설정.")
-                if 'xmlns' in html_tag.attrs and html_tag['xmlns'] == "http://www.w3.org/1999/xhtml":
-                    if html_tag.get('xml:lang') != 'ko':
-                         html_tag['xml:lang'] = 'ko'
-                         logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정.")
-                elif html_tag.get('xml:lang') and html_tag.get('xml:lang') != 'ko':
-                     html_tag['xml:lang'] = 'ko'
-                     logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정 (네임스페이스 없음).")
+            # html.parser로 재파싱하면 XHTML 구조(자기닫힘 태그, 네임스페이스 등)가 손상될 수 있으므로
+            # 정규식으로 <html> 태그의 lang 속성만 직접 수정합니다.
+            final_xhtml_str = reconstructed_xhtml
+            html_open_match = re.search(r'(<html\b[^>]*?)(\/?>)', final_xhtml_str, re.IGNORECASE | re.DOTALL)
+            if html_open_match:
+                attrs_str = html_open_match.group(1)
+                close_str = html_open_match.group(2)
+                original_attrs_str = attrs_str
 
-            final_xhtml_str = str(soup)
+                # lang 속성 설정
+                if re.search(r'\blang\s*=\s*["\'][^"\']*["\']', attrs_str):
+                    if not re.search(r'\blang\s*=\s*["\']ko["\']', attrs_str):
+                        attrs_str = re.sub(r'\blang\s*=\s*["\'][^"\']*["\']', 'lang="ko"', attrs_str)
+                        logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 설정.")
+                else:
+                    attrs_str += ' lang="ko"'
+                    logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 추가.")
+
+                # xml:lang 속성 설정 (xmlns xhtml 또는 기존 xml:lang이 있을 때)
+                has_xmlns_xhtml = 'http://www.w3.org/1999/xhtml' in original_attrs_str
+                has_xml_lang = bool(re.search(r'\bxml:lang\s*=', original_attrs_str))
+                if has_xmlns_xhtml or has_xml_lang:
+                    if re.search(r'\bxml:lang\s*=\s*["\'][^"\']*["\']', attrs_str):
+                        if not re.search(r'\bxml:lang\s*=\s*["\']ko["\']', attrs_str):
+                            attrs_str = re.sub(r'\bxml:lang\s*=\s*["\'][^"\']*["\']', 'xml:lang="ko"', attrs_str)
+                            logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정.")
+                    else:
+                        attrs_str += ' xml:lang="ko"'
+                        logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 추가.")
+
+                new_html_tag = attrs_str + close_str
+                final_xhtml_str = (
+                    final_xhtml_str[:html_open_match.start()]
+                    + new_html_tag
+                    + final_xhtml_str[html_open_match.end():]
+                )
+
             xhtml_bytes = final_xhtml_str.encode('utf-8')
             return xhtml_bytes
 
-        except Exception as soup_proc_err:
-            logging.error(f"XHTML 파싱 또는 최종 처리 중 오류 ({xhtml_base_name}): {soup_proc_err}", exc_info=True)
+        except Exception as lang_proc_err:
+            logging.error(f"XHTML lang 속성 수정 중 오류 ({xhtml_base_name}): {lang_proc_err}", exc_info=True)
             return reconstructed_xhtml.encode('utf-8')
 
     except Exception as recon_err:
