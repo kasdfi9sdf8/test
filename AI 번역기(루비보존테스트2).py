@@ -5,7 +5,7 @@ import json
 import re
 from collections import Counter
 from bs4 import BeautifulSoup, NavigableString
-import google.generativeai as genai
+from google import genai
 from google.genai import types
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
@@ -23,6 +23,37 @@ import concurrent.futures
 import copy
 import uuid
 import traceback
+
+# ── google.genai GenerativeModel 호환 래퍼 ───────────────────────────
+class GeminiModel:
+    """google.genai Client 기반 래퍼 (GenerativeModel 인터페이스 호환)"""
+    def __init__(self, client, model_name, safety_settings=None, generation_config=None):
+        self.client = client
+        self.model_name = model_name
+        self.safety_settings = safety_settings or []
+        self.generation_config = generation_config or {}
+
+    def generate_content(self, prompt, stream=False):
+        cfg = types.GenerateContentConfig(
+            temperature=self.generation_config.get('temperature'),
+            top_p=self.generation_config.get('top_p'),
+            top_k=self.generation_config.get('top_k'),
+            safety_settings=self.safety_settings,
+            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
+        )
+        if stream:
+            return self.client.models.generate_content_stream(
+                model=self.model_name,
+                contents=prompt,
+                config=cfg,
+            )
+        else:
+            return self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=cfg,
+            )
+
 
 # ── Gemini safety settings ───────────────────────────
 safety_settings = [
@@ -489,8 +520,8 @@ def select_gemini_model(api_key):
     available_models = []
     available_models_display = []
 
-    for m in genai.list_models():
-        if 'generateContent' in m.supported_generation_methods:
+    for m in client.models.list():
+        if 'generateContent' in (getattr(m, 'supported_actions', None) or getattr(m, 'supported_generation_methods', [])):
             available_models.append(m.name)
             available_models_display.append(m.name.replace("models/", ""))
 
@@ -792,6 +823,13 @@ def detect_japanese_or_chinese(text):
 
 # --- 2. EPUB 파일 처리 (저수준) ---
 
+def clean_text_from_tags(html_content):
+    """HTML 태그를 제거하고 순수 텍스트 내용만 반환합니다."""
+    if not html_content:
+        return ""
+    return re.sub(r'<[^>]+>', '', html_content)
+
+
 def find_opf_file(epub_file):
     for item in epub_file.infolist():
         if item.filename.endswith(".opf"):
@@ -1085,9 +1123,22 @@ def add_text_block(xhtml_json_list, text_block_content, text_block_counter,
              save_txt_file(final_text_content, origin_filename)
              # shutil.copy2(text_block_filename, origin_filename) # 정제된 파일 복사
 
+        # 원본 HTML 구조 저장: 재구성 시 원본 태그(클래스 등) 복원에 사용
+        struct_filename = os.path.join(output_dir, f"text_block_{text_block_counter}.struct.txt")
+        if not os.path.exists(struct_filename):
+            struct_html_lines = [
+                line for line in text_block_content.splitlines()
+                if clean_text_from_tags(line).strip()
+            ]
+            if struct_html_lines:
+                save_txt_file("\n".join(struct_html_lines), struct_filename)
+            else:
+                struct_filename = None
+        
         xhtml_json_list.append({
             "type": "text_block",
-            "content": text_block_filename
+            "content": text_block_filename,
+            "struct": struct_filename
         })
         logging.debug(f"Added text block: {text_block_filename}")
         return xhtml_json_list, text_block_counter + 1
@@ -1504,7 +1555,8 @@ def translate_text_blocks(output_dir, json_data, selected_model, api_key, temper
 
     generation_config = {"temperature": temperature, "top_p": top_p, "top_k": top_k}
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config)
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config)
     except Exception as model_err:
         print_colored(f"Error: Failed create Gemini model instance ({selected_model}): {model_err}", colorama.Fore.RED, colorama.Style.BRIGHT)
         return [], 0, 0
@@ -1996,7 +2048,8 @@ def translate_lines(output_dir, selected_model, api_key, temperature, top_p, top
          return 0, 0, True
 
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
     except Exception as model_err:
         logging.error(f"Failed create model in translate_lines: {model_err}")
         return 0, 0, False
@@ -2191,7 +2244,8 @@ def retranslate_incomplete_blocks(output_dir, selected_model, api_key, temperatu
                                   previous_context_number, retranslate_max_retries, num_parallel=5):
     print("\n\n[QC 2 단계] 텍스트 블록 별 시작/마지막 문장 비교 시작")
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
         additional_instructions = load_prompt()
         global base_prompt_text
         if 'base_prompt_text' not in globals(): raise NameError("'base_prompt_text' is not defined globally.")
@@ -2596,7 +2650,8 @@ def retranslate_by_line_count(output_dir, selected_model, api_key, temperature, 
                               previous_context_number, retranslate_max_retries, translation_data, num_parallel=5):
     print("\n\n[QC 1 단계] 텍스트 블록 원본/번역본 문장 수 비교 시작")
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 1.5, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 1.5, "top_p": top_p, "top_k": top_k})
         additional_instructions = load_prompt()
         global base_prompt_text
         if 'base_prompt_text' not in globals(): raise NameError("'base_prompt_text' is not defined globally.")
@@ -3089,7 +3144,7 @@ def retranslate_text_blocks(output_dir, selected_model, api_key, temperature, to
         input_chars_current_retry = 0
         output_chars_current_retry = 0
         client = genai.Client(api_key=api_key)
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 2, "top_p": top_p, "top_k": top_k})
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 2, "top_p": top_p, "top_k": top_k})
 
 
         with tqdm(total=len(files_to_retranslate), desc=f"재번역 {retry_count}차 진행률", unit="파일", dynamic_ncols=True) as pbar_retranslate:
@@ -3168,7 +3223,7 @@ def translate_lines_for_retranslate(line_files, selected_model, api_key, tempera
         "top_p": top_p,
         "top_k": top_k,
     }
-    model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config) # model 객체 생성
+    model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config) # model 객체 생성
 
     total_input_chars = 0
     total_output_chars = 0
@@ -5016,20 +5071,61 @@ def reconstruct_translated_xhtml(xhtml_base_name, json_data, output_dir, mode=No
             
             # --- START: 여기가 수정된 핵심 로직입니다. ---
             elif block_type.startswith("text_block"):
+                # 원본 HTML 구조 파일 로드 (원본 태그/클래스 복원에 사용)
+                struct_filepath = block.get("struct")
+                struct_html_lines = []
+                if struct_filepath:
+                    if not os.path.isabs(struct_filepath):
+                        struct_filepath = os.path.join(output_dir, struct_filepath)
+                    if os.path.exists(struct_filepath):
+                        try:
+                            with open(struct_filepath, 'r', encoding='utf-8') as sf:
+                                struct_html_lines = sf.read().splitlines()
+                        except Exception as struct_err:
+                            logging.warning(f"구조 파일 읽기 실패 ({struct_filepath}): {struct_err}")
+
                 processed_lines = []
-                for line in content_part.splitlines():
-                    stripped_line = line.strip()
-                    if stripped_line:
-                        # 줄이 HTML 태그(예: <ruby>)로 시작하는지 확인
-                        is_html_like = re.match(r'^\s*<.+>', stripped_line, re.DOTALL)
-                        
-                        if is_html_like:
-                            # 이미 태그가 있으면 그대로 추가
-                            processed_lines.append(stripped_line) 
+                translated_lines = [l for l in content_part.splitlines() if l.strip()]
+
+                if struct_html_lines:
+                    # 원본 HTML 구조(태그, 클래스 등)를 유지하면서 번역된 텍스트로 교체
+                    for i, trans_line in enumerate(translated_lines):
+                        if i < len(struct_html_lines):
+                            struct_line = struct_html_lines[i]
+                            # 최외곽 태그 추출: <tag attrs>...</tag>
+                            tag_wrap = re.match(
+                                r'^(\s*<([a-zA-Z][a-zA-Z0-9]*)\b[^>]*>)(.*?)(<\/\2\s*>)\s*$',
+                                struct_line, re.DOTALL
+                            )
+                            if tag_wrap:
+                                open_tag = tag_wrap.group(1)
+                                close_tag = tag_wrap.group(4)
+                                processed_lines.append(f'{open_tag}{trans_line}{close_tag}')
+                            elif re.match(r'^\s*<.+>', struct_line, re.DOTALL):
+                                # 닫힘 태그 없는 자기닫힘 등 특수 구조 → 원본 유지
+                                processed_lines.append(struct_line)
+                            else:
+                                processed_lines.append(f'<p class="korean_style">{trans_line}</p>')
                         else:
-                            # 순수 텍스트 줄에만 <p> 태그 추가
-                            processed_lines.append(f'<p class="korean_style">{stripped_line}</p>')
-                
+                            # 구조 파일보다 번역 줄이 많은 경우 기본 태그로 래핑
+                            processed_lines.append(f'<p class="korean_style">{trans_line}</p>')
+                else:
+                    # 구조 파일 없는 경우: 원본 들여쓰기와 빈 줄을 보존
+                    for line in content_part.splitlines():
+                        stripped_line = line.strip()
+                        if stripped_line:
+                            # 줄이 HTML 태그(예: <ruby>)로 시작하는지 확인
+                            is_html_like = re.match(r'^\s*<.+>', line, re.DOTALL)
+                            if is_html_like:
+                                # 이미 태그가 있으면 원본 들여쓰기 유지
+                                processed_lines.append(line)
+                            else:
+                                # 순수 텍스트 줄에만 <p> 태그 추가
+                                processed_lines.append(f'<p class="korean_style">{stripped_line}</p>')
+                        else:
+                            # 빈 줄(간격)도 보존
+                            processed_lines.append(line)
+
                 body_parts.append("\n".join(processed_lines))
             # --- END: 수정된 핵심 로직 끝 ---
             
@@ -5045,26 +5141,48 @@ def reconstruct_translated_xhtml(xhtml_base_name, json_data, output_dir, mode=No
         logging.debug(f"XHTML '{xhtml_base_name}' 내용 재구성 완료.")
 
         try:
-            soup = BeautifulSoup(reconstructed_xhtml, 'html.parser')
-            html_tag = soup.find('html')
-            if html_tag:
-                if html_tag.get('lang') != 'ko':
-                    html_tag['lang'] = 'ko'
-                    logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 설정.")
-                if 'xmlns' in html_tag.attrs and html_tag['xmlns'] == "http://www.w3.org/1999/xhtml":
-                    if html_tag.get('xml:lang') != 'ko':
-                         html_tag['xml:lang'] = 'ko'
-                         logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정.")
-                elif html_tag.get('xml:lang') and html_tag.get('xml:lang') != 'ko':
-                     html_tag['xml:lang'] = 'ko'
-                     logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정 (네임스페이스 없음).")
+            # html.parser로 재파싱하면 XHTML 구조(자기닫힘 태그, 네임스페이스 등)가 손상될 수 있으므로
+            # 정규식으로 <html> 태그의 lang 속성만 직접 수정합니다.
+            final_xhtml_str = reconstructed_xhtml
+            html_open_match = re.search(r'(<html\b[^>]*?)(\/?>)', final_xhtml_str, re.IGNORECASE | re.DOTALL)
+            if html_open_match:
+                attrs_str = html_open_match.group(1)
+                close_str = html_open_match.group(2)
+                original_attrs_str = attrs_str
 
-            final_xhtml_str = str(soup)
+                # lang 속성 설정
+                if re.search(r'\blang\s*=\s*["\'][^"\']*["\']', attrs_str):
+                    if not re.search(r'\blang\s*=\s*["\']ko["\']', attrs_str):
+                        attrs_str = re.sub(r'\blang\s*=\s*["\'][^"\']*["\']', 'lang="ko"', attrs_str)
+                        logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 설정.")
+                else:
+                    attrs_str += ' lang="ko"'
+                    logging.debug(f"    - {xhtml_base_name}: html lang 속성을 'ko'로 추가.")
+
+                # xml:lang 속성 설정 (xmlns xhtml 또는 기존 xml:lang이 있을 때)
+                has_xmlns_xhtml = 'http://www.w3.org/1999/xhtml' in original_attrs_str
+                has_xml_lang = bool(re.search(r'\bxml:lang\s*=', original_attrs_str))
+                if has_xmlns_xhtml or has_xml_lang:
+                    if re.search(r'\bxml:lang\s*=\s*["\'][^"\']*["\']', attrs_str):
+                        if not re.search(r'\bxml:lang\s*=\s*["\']ko["\']', attrs_str):
+                            attrs_str = re.sub(r'\bxml:lang\s*=\s*["\'][^"\']*["\']', 'xml:lang="ko"', attrs_str)
+                            logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 설정.")
+                    else:
+                        attrs_str += ' xml:lang="ko"'
+                        logging.debug(f"    - {xhtml_base_name}: html xml:lang 속성을 'ko'로 추가.")
+
+                new_html_tag = attrs_str + close_str
+                final_xhtml_str = (
+                    final_xhtml_str[:html_open_match.start()]
+                    + new_html_tag
+                    + final_xhtml_str[html_open_match.end():]
+                )
+
             xhtml_bytes = final_xhtml_str.encode('utf-8')
             return xhtml_bytes
 
-        except Exception as soup_proc_err:
-            logging.error(f"XHTML 파싱 또는 최종 처리 중 오류 ({xhtml_base_name}): {soup_proc_err}", exc_info=True)
+        except Exception as lang_proc_err:
+            logging.error(f"XHTML lang 속성 수정 중 오류 ({xhtml_base_name}): {lang_proc_err}", exc_info=True)
             return reconstructed_xhtml.encode('utf-8')
 
     except Exception as recon_err:
@@ -5122,54 +5240,74 @@ def process_ncx(ncx_bytes, updated_metadata, nav_translations, model, api_call_d
 
         items_translated_count = 0
         logging.info("NCX 내비게이션 항목 번역 시작...")
+
+        # --- 1단계: 모든 navLabel 수집 및 사전 번역 적용 ---
+        nav_label_nodes = []  # (text_tag, original_nav_text) 쌍
+        api_needed_texts = []  # API 번역이 필요한 고유 원문 목록 (순서 유지)
+        api_needed_set = set()
+
         for navLabel in tree.findall('.//ncx:navMap//ncx:navLabel', NS):
             text_tag = navLabel.find('ncx:text', NS)
             if text_tag is not None and text_tag.text:
                 original_nav_text = text_tag.text.strip()
-                if not original_nav_text: continue
-
+                if not original_nav_text:
+                    continue
                 translated_text_dict = nav_translations.get(original_nav_text)
-                translated_text_final = None
-                translation_source = None
-
                 if translated_text_dict and translated_text_dict != original_nav_text:
-                    translated_text_final = translated_text_dict
-                    translation_source = 'Dictionary'
-                elif not translated_text_dict:
-                    current_time = time.time()
-                    time_since_last_call = current_time - last_api_call_time_ref[0]
-                    if time_since_last_call < api_call_delay:
-                        sleep_time = api_call_delay - time_since_last_call
-                        time.sleep(sleep_time)
-
+                    # 사전에서 즉시 번역
                     try:
-                        nav_translation_prompt = "Translate the following Japanese navigation menu item text to Korean. Output only the Korean translation, without any explanations or quotation marks: '{text}'"
-                        prompt = nav_translation_prompt.format(text=original_nav_text)
-                        response = model.generate_content(prompt)
-                        last_api_call_time_ref[0] = time.time()
-                        translated_text_api_raw = response.text.strip()
-                        translated_text_api = translated_text_api_raw.strip('"\'')
-
-                        if translated_text_api and translated_text_api != original_nav_text:
-                            translated_text_final = translated_text_api
-                            translation_source = 'API'
-                        else:
-                            logging.warning(f"API translation failed or no change (NCX Nav: '{original_nav_text}'). Raw result: '{translated_text_api_raw}'")
-
-                    except InvalidArgument as iae:
-                         last_api_call_time_ref[0] = time.time()
-                         logging.error(f"NCX Nav 항목 '{original_nav_text}' API 호출 중 InvalidArgument 오류: {iae}")
-                    except Exception as api_err:
-                        last_api_call_time_ref[0] = time.time()
-                        logging.error(f"NCX 내비게이션 항목 '{original_nav_text}' API 번역 중 오류: {api_err}")
-
-                if translated_text_final:
-                    try:
-                        text_tag.text = translated_text_final
+                        text_tag.text = translated_text_dict
                         ncx_modified = True
                         items_translated_count += 1
                     except Exception as replace_err:
                         logging.error(f"NCX navLabel 텍스트 교체 중 오류 ('{original_nav_text}'): {replace_err}")
+                elif not translated_text_dict:
+                    # API 번역이 필요한 항목 수집
+                    nav_label_nodes.append((text_tag, original_nav_text))
+                    if original_nav_text not in api_needed_set:
+                        api_needed_texts.append(original_nav_text)
+                        api_needed_set.add(original_nav_text)
+
+        # --- 2단계: API 번역이 필요한 항목을 단일 배치 호출로 번역 ---
+        api_translation_map = {}
+        if api_needed_texts:
+            current_time = time.time()
+            time_since_last_call = current_time - last_api_call_time_ref[0]
+            if time_since_last_call < api_call_delay:
+                time.sleep(api_call_delay - time_since_last_call)
+
+            batch_prompt = (
+                "Translate each of the following Japanese navigation menu items to Korean. "
+                "Output exactly one Korean translation per line, in the same order, "
+                "without line numbers, explanations, or quotation marks:\n"
+                + "\n".join(api_needed_texts)
+            )
+            try:
+                response = model.generate_content(batch_prompt)
+                last_api_call_time_ref[0] = time.time()
+                result_lines = [l.strip().strip('"\'') for l in response.text.splitlines() if l.strip()]
+                for i, orig in enumerate(api_needed_texts):
+                    if i < len(result_lines) and result_lines[i] and result_lines[i] != orig:
+                        api_translation_map[orig] = result_lines[i]
+                    else:
+                        logging.warning(f"NCX 배치 번역: 항목 '{orig}'에 대한 결과 없음 또는 변경 없음.")
+            except InvalidArgument as iae:
+                last_api_call_time_ref[0] = time.time()
+                logging.error(f"NCX 배치 API 호출 중 InvalidArgument 오류: {iae}")
+            except Exception as api_err:
+                last_api_call_time_ref[0] = time.time()
+                logging.error(f"NCX 배치 API 번역 중 오류: {api_err}")
+
+        # --- 3단계: 배치 번역 결과 적용 ---
+        for text_tag, original_nav_text in nav_label_nodes:
+            translated_text_final = api_translation_map.get(original_nav_text)
+            if translated_text_final:
+                try:
+                    text_tag.text = translated_text_final
+                    ncx_modified = True
+                    items_translated_count += 1
+                except Exception as replace_err:
+                    logging.error(f"NCX navLabel 텍스트 교체 중 오류 ('{original_nav_text}'): {replace_err}")
 
         if ncx_modified:
             logging.info(f"NCX 파일 수정 완료 ({items_translated_count}개 항목 번역됨). 직렬화 중...")
@@ -5265,7 +5403,11 @@ def process_nav_doc(nav_doc_bytes, updated_metadata, model, api_call_delay, last
         if nav_items:
              logging.info("Nav Doc 내비게이션 항목 번역 시작...")
              global NAV_TRANSLATIONS
-             nav_translation_prompt = "Translate the following Japanese navigation menu item text to Korean. Output only the Korean translation, without any explanations or quotation marks: '{text}'"
+
+             # --- 1단계: target_node 추출 및 사전 번역 적용 ---
+             item_node_pairs = []  # (target_node, original_text) - API 번역 필요 항목
+             api_needed_texts_nav = []  # API 번역이 필요한 고유 원문 (순서 유지)
+             api_needed_set_nav = set()
 
              for item_tag in nav_items:
                  target_node = None
@@ -5282,43 +5424,55 @@ def process_nav_doc(nav_doc_bytes, updated_metadata, model, api_call_delay, last
                  original_text = str(target_node).strip()
                  if not original_text: continue
 
-                 translated_text_final = None
-                 translation_source = None
-
                  translated_text_dict = NAV_TRANSLATIONS.get(original_text)
                  if translated_text_dict is not None and translated_text_dict != original_text:
-                     translated_text_final = translated_text_dict
-                     translation_source = 'Dictionary'
-
-                 is_api_condition_met = translated_text_dict is None
-
-                 if is_api_condition_met:
-                     current_time = time.time()
-                     time_since_last_call = current_time - last_api_call_time_ref[0]
-                     if time_since_last_call < api_call_delay:
-                         sleep_time = api_call_delay - time_since_last_call
-                         time.sleep(sleep_time)
-
+                     # 사전에서 즉시 번역
                      try:
-                         prompt = nav_translation_prompt.format(text=original_text)
-                         response = model.generate_content(prompt)
-                         last_api_call_time_ref[0] = time.time()
-                         translated_text_api_raw = response.text
-                         translated_text_api = translated_text_api_raw.strip().strip('"\'')
+                         target_node.replace_with(NavigableString(translated_text_dict))
+                         content_modified_by_soup = True
+                         items_translated_count += 1
+                     except Exception as replace_err:
+                         logging.error(f"Nav Doc 텍스트 교체 중 오류 ('{original_text}' -> '{translated_text_dict}'): {replace_err}")
+                 elif translated_text_dict is None:
+                     # API 번역이 필요한 항목 수집
+                     item_node_pairs.append((target_node, original_text))
+                     if original_text not in api_needed_set_nav:
+                         api_needed_texts_nav.append(original_text)
+                         api_needed_set_nav.add(original_text)
 
-                         if translated_text_api and translated_text_api != original_text:
-                             translated_text_final = translated_text_api
-                             translation_source = 'API'
+             # --- 2단계: API 번역이 필요한 항목을 단일 배치 호출로 번역 ---
+             api_translation_map_nav = {}
+             if api_needed_texts_nav:
+                 current_time = time.time()
+                 time_since_last_call = current_time - last_api_call_time_ref[0]
+                 if time_since_last_call < api_call_delay:
+                     time.sleep(api_call_delay - time_since_last_call)
+
+                 batch_prompt = (
+                     "Translate each of the following Japanese navigation menu items to Korean. "
+                     "Output exactly one Korean translation per line, in the same order, "
+                     "without line numbers, explanations, or quotation marks:\n"
+                     + "\n".join(api_needed_texts_nav)
+                 )
+                 try:
+                     response = model.generate_content(batch_prompt)
+                     last_api_call_time_ref[0] = time.time()
+                     result_lines = [l.strip().strip('"\'') for l in response.text.splitlines() if l.strip()]
+                     for i, orig in enumerate(api_needed_texts_nav):
+                         if i < len(result_lines) and result_lines[i] and result_lines[i] != orig:
+                             api_translation_map_nav[orig] = result_lines[i]
                          else:
-                             logging.warning(f"API translation failed or no change (Nav Doc: '{original_text}'). Raw result: '{translated_text_api_raw}'")
+                             logging.warning(f"Nav Doc 배치 번역: 항목 '{orig}'에 대한 결과 없음 또는 변경 없음.")
+                 except InvalidArgument as iae:
+                     last_api_call_time_ref[0] = time.time()
+                     logging.error(f"Nav Doc 배치 API 호출 중 InvalidArgument 오류: {iae}")
+                 except Exception as api_err:
+                     last_api_call_time_ref[0] = time.time()
+                     logging.error(f"Nav Doc 배치 API 번역 중 오류: {api_err}")
 
-                     except InvalidArgument as iae:
-                          last_api_call_time_ref[0] = time.time()
-                          logging.error(f"Nav Doc 항목 '{original_text}' API 호출 중 InvalidArgument 오류: {iae}")
-                     except Exception as api_err:
-                         last_api_call_time_ref[0] = time.time()
-                         logging.error(f"Nav Doc 항목 '{original_text}' API 번역 중 오류: {api_err}")
-
+             # --- 3단계: 배치 번역 결과 적용 ---
+             for target_node, original_text in item_node_pairs:
+                 translated_text_final = api_translation_map_nav.get(original_text)
                  if translated_text_final:
                      try:
                          target_node.replace_with(NavigableString(translated_text_final))
@@ -6224,7 +6378,7 @@ if __name__ == "__main__":
                 if json_data and output_dir:
                     try:
                         client = genai.Client(api_key=api_key)
-                        model = genai.GenerativeModel(selected_model, safety_settings=safety_settings)
+                        model = GeminiModel(client, selected_model, safety_settings=safety_settings)
                     except Exception as model_init_err:
                          print_colored(f"Error: Gemini 모델 초기화 실패: {model_init_err}", colorama.Fore.RED)
                          model = None
