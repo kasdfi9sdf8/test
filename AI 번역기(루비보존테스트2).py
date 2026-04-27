@@ -5,7 +5,7 @@ import json
 import re
 from collections import Counter
 from bs4 import BeautifulSoup, NavigableString
-import google.generativeai as genai
+from google import genai
 from google.genai import types
 import xml.etree.ElementTree as ET
 from tqdm import tqdm
@@ -23,6 +23,36 @@ import concurrent.futures
 import copy
 import uuid
 import traceback
+
+# ── google.genai GenerativeModel 호환 래퍼 ───────────────────────────
+class GeminiModel:
+    """google.genai Client 기반 래퍼 (GenerativeModel 인터페이스 호환)"""
+    def __init__(self, client, model_name, safety_settings=None, generation_config=None):
+        self.client = client
+        self.model_name = model_name
+        self.safety_settings = safety_settings or []
+        self.generation_config = generation_config or {}
+
+    def generate_content(self, prompt, stream=False):
+        cfg = types.GenerateContentConfig(
+            temperature=self.generation_config.get('temperature'),
+            top_p=self.generation_config.get('top_p'),
+            top_k=self.generation_config.get('top_k'),
+            safety_settings=self.safety_settings,
+        )
+        if stream:
+            return self.client.models.generate_content_stream(
+                model=self.model_name,
+                contents=prompt,
+                config=cfg,
+            )
+        else:
+            return self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=cfg,
+            )
+
 
 # ── Gemini safety settings ───────────────────────────
 safety_settings = [
@@ -489,8 +519,8 @@ def select_gemini_model(api_key):
     available_models = []
     available_models_display = []
 
-    for m in genai.list_models():
-        if 'generateContent' in m.supported_generation_methods:
+    for m in client.models.list():
+        if 'generateContent' in (getattr(m, 'supported_actions', None) or getattr(m, 'supported_generation_methods', [])):
             available_models.append(m.name)
             available_models_display.append(m.name.replace("models/", ""))
 
@@ -1504,7 +1534,8 @@ def translate_text_blocks(output_dir, json_data, selected_model, api_key, temper
 
     generation_config = {"temperature": temperature, "top_p": top_p, "top_k": top_k}
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config)
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config)
     except Exception as model_err:
         print_colored(f"Error: Failed create Gemini model instance ({selected_model}): {model_err}", colorama.Fore.RED, colorama.Style.BRIGHT)
         return [], 0, 0
@@ -1996,7 +2027,8 @@ def translate_lines(output_dir, selected_model, api_key, temperature, top_p, top
          return 0, 0, True
 
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
     except Exception as model_err:
         logging.error(f"Failed create model in translate_lines: {model_err}")
         return 0, 0, False
@@ -2191,7 +2223,8 @@ def retranslate_incomplete_blocks(output_dir, selected_model, api_key, temperatu
                                   previous_context_number, retranslate_max_retries, num_parallel=5):
     print("\n\n[QC 2 단계] 텍스트 블록 별 시작/마지막 문장 비교 시작")
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": temperature, "top_p": top_p, "top_k": top_k})
         additional_instructions = load_prompt()
         global base_prompt_text
         if 'base_prompt_text' not in globals(): raise NameError("'base_prompt_text' is not defined globally.")
@@ -2596,7 +2629,8 @@ def retranslate_by_line_count(output_dir, selected_model, api_key, temperature, 
                               previous_context_number, retranslate_max_retries, translation_data, num_parallel=5):
     print("\n\n[QC 1 단계] 텍스트 블록 원본/번역본 문장 수 비교 시작")
     try:
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 1.5, "top_p": top_p, "top_k": top_k})
+        client = genai.Client(api_key=api_key)
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 1.5, "top_p": top_p, "top_k": top_k})
         additional_instructions = load_prompt()
         global base_prompt_text
         if 'base_prompt_text' not in globals(): raise NameError("'base_prompt_text' is not defined globally.")
@@ -3089,7 +3123,7 @@ def retranslate_text_blocks(output_dir, selected_model, api_key, temperature, to
         input_chars_current_retry = 0
         output_chars_current_retry = 0
         client = genai.Client(api_key=api_key)
-        model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 2, "top_p": top_p, "top_k": top_k})
+        model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config={"temperature": 2, "top_p": top_p, "top_k": top_k})
 
 
         with tqdm(total=len(files_to_retranslate), desc=f"재번역 {retry_count}차 진행률", unit="파일", dynamic_ncols=True) as pbar_retranslate:
@@ -3168,7 +3202,7 @@ def translate_lines_for_retranslate(line_files, selected_model, api_key, tempera
         "top_p": top_p,
         "top_k": top_k,
     }
-    model = genai.GenerativeModel(model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config) # model 객체 생성
+    model = GeminiModel(client, model_name=selected_model, safety_settings=safety_settings, generation_config=generation_config) # model 객체 생성
 
     total_input_chars = 0
     total_output_chars = 0
@@ -6224,7 +6258,7 @@ if __name__ == "__main__":
                 if json_data and output_dir:
                     try:
                         client = genai.Client(api_key=api_key)
-                        model = genai.GenerativeModel(selected_model, safety_settings=safety_settings)
+                        model = GeminiModel(client, selected_model, safety_settings=safety_settings)
                     except Exception as model_init_err:
                          print_colored(f"Error: Gemini 모델 초기화 실패: {model_init_err}", colorama.Fore.RED)
                          model = None
