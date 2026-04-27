@@ -39,6 +39,7 @@ class GeminiModel:
             top_p=self.generation_config.get('top_p'),
             top_k=self.generation_config.get('top_k'),
             safety_settings=self.safety_settings,
+            thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.MINIMAL),
         )
         if stream:
             return self.client.models.generate_content_stream(
